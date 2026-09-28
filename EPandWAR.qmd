@@ -1,0 +1,552 @@
+---
+title: "NCAA Volleyball Expected Points and WAR Model"
+subtitle: "A Rally Level Value Framework for Player Evaluation"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(lubridate)
+library(speedglm)
+library(ggplot2)
+library(forcats)
+library(DT)
+
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+## Executive Summary
+
+Traditional volleyball box-score statistics typically record a team’s and player’s kills, digs, assists, points scored, and other metrics during a game. However, these numbers often fail to account for a player’s specific role on the court or the actual game context in which points are scored. This makes it difficult to truly measure how much a player contributes to their team’s victories.
+
+Therefore, we created this project with the goal of more accurately evaluating each player’s contribution to their team during actual matches, starting from data collected per rally and incorporating positional adjustment values. With data collected from the 2024 NCAA Division I Women’s Volleyball season we developed an Expected Points (EP) model used to estimate the probability that each offensive play will result in the team winning the rally and scoring a point. Building upon this foundation, we further developed a Wins Above Replacement (WAR) model to quantify the performance value of players across different positions.
+
+We combined five data sets from the women's 2024 season (play-by-play, player match, player season, team match, and team season) to structure a single data set where each row represented a single rally where a point was scored. Using our rally level data we fitted a logistic regression model to estimate Expected Points (EP) or the probability that the home team scored the next point, based on the score differential, set number, and event type. Each rally's Expected Points Added (EPA) was defined by the difference in the predicted probabilities of the home team scoring before and after each rally. We aggregated EPA by player and adjusted for position specific replacement levels, which we defined as players within the bottom 20% of EPA values within each position, to produce a Wins Above Replacement (WAR) metric, that quantified how many points a player added above a typical replacement level player.
+
+Our results revealed clear positional patterns, showing how players at different positions translate efficiency into tangible value in distinct ways. For instance, opposite and outside hitters displayed the strongest positive correlation between efficiency, measured by mean EPA per rally, and total value, represented by WAR metric. This demonstrates the critical offense roles of these positions and their ability to generate substantial on-court impact. Setters consistently exhibited high WAR values despite moderate EPA, highlighting their contribution through play making rather than direct scoring. Liberos and defensive specialists, however, showed a relatively flat relationship between WAR and EPA values, reflecting highly consistent defensive contributions with minimal fluctuation.
+
+Overall, this analytical framework moves us beyond surface level box-score statistics. By integrating positional roles, it enables a more comprehensive and game realistic assessment of each player's contribution by position group.
+
+## Model Overview
+
+Utilizing detailed play-by-play data from the `ncaavolleyballr` package on GitHub, we developed the Expected Points (EP) model and WAR-like metrics to evaluate individual contributions.
+
+Inspired by similar analytical approaches in other sports, such as expected goals in soccer and ice hockey, our methodology adapts to volleyball’s unique rotation structure, where each action (serve, attack, block, or error) can instantly alter the probability of winning the next point.
+
+Key features of the model include:
+
+- Treating each rotation as an independent “tactical unit”
+
+- Estimating the expected scoring probability for each rotation
+
+- Aggregating these probabilities into player-level Expected Points Added (EPA) and position-adjusted metrics analogous to WAR
+
+This report details the methodology behind our NCAA volleyball player expected scoring model, demonstrates its ability to measure player and positional impact, and highlights its utility in identifying the most influential players on the court.
+
+## Data Sourcing & Data Pipelines
+
+We utilized data from the 2024 NCAA Division 1 women's volleyball season available from the `ncaavolleyballr` repository.
+
+- `wvb_pbp_div1_2024.csv` – play-by-play event data
+
+- `wvb_playermatch_div1_2024.csv` – per match player statistics
+
+- `wvb_playerseason_div1_2024.csv` – cumulative season player statistics
+
+- `wvb_teammatch_div1_2024.csv` – per match team statistics
+
+- `wvb_teamseason_div1_2024.csv` – season level team statistics
+
+```{r}
+#| code-summary: "Expand to view data ingestion scripts"
+
+url1<- "https://media.githubusercontent.com/media/JeffreyRStevens/ncaavolleyballr/refs/heads/main/data-csv/wvb_teamseason_div1_2024.csv"
+teamseason <- read_csv(url1)
+
+url2 <- "https://media.githubusercontent.com/media/JeffreyRStevens/ncaavolleyballr/refs/heads/main/data-csv/wvb_pbp_div1_2024.csv"
+pbp <- read_csv(url2)
+
+url3 <- "https://media.githubusercontent.com/media/JeffreyRStevens/ncaavolleyballr/refs/heads/main/data-csv/wvb_playermatch_div1_2024.csv"
+playermatch <- read_csv(url3)
+
+url4 <-"https://media.githubusercontent.com/media/JeffreyRStevens/ncaavolleyballr/refs/heads/main/data-csv/wvb_playerseason_div1_2024.csv"
+playerseason <- read_csv(url4)
+
+url5 <- "https://media.githubusercontent.com/media/JeffreyRStevens/ncaavolleyballr/refs/heads/main/data-csv/wvb_teammatch_div1_2024.csv"
+teammatch <- read_csv(url5)
+```
+
+To transform the raw play-by-play events into a structured dataset ready for machine learning, we built functionalized cleaning pipelines to standardize features and calculate active point differentials.
+
+```{r}
+#| code-summary: "Expand to view data cleaning pipeline functions"
+
+# create function to clean names
+clean_names_safe <- function(df){
+  out <- df
+  names(out) <- names(out) |>
+    str_trim() |>
+    str_replace_all("\\s+", "_") |>
+    str_replace_all("[()/]", "_") |>
+    tolower()
+  as_tibble(out, .name_repair = "unique")}
+
+process_volleyball_data <- function(pbp_raw, teammatch_raw, playermatch_raw) {
+  # clean column names
+  pbp_c          <- clean_names_safe(pbp_raw)
+  teammatch_c    <- clean_names_safe(teammatch_raw)
+  playermatch_c  <- clean_names_safe(playermatch_raw)
+  
+  # parse dates safely
+  pbp_c <- pbp_c %>% mutate(date = mdy(as.character(date)))
+  
+  teammatch_c <- teammatch_c %>%
+    mutate(date_parsed = mdy(as.character(date)),
+           date_clean = str_remove_all(date, "\\s*\\(\\d+\\)"),
+           date_parsed = coalesce(date_parsed, mdy(date_clean))) %>%
+    select(-date_clean)
+  
+  playermatch_c <- playermatch_c %>%
+    mutate(date_parsed = coalesce(as.Date(date), ymd(as.character(date))))
+  
+  # structural score engineering
+  pbp_c <- pbp_c %>%
+    mutate(score = str_trim(score)) %>%
+    tidyr::separate(score, 
+                    into = c("home_score_chr", "away_score_chr"), 
+                    sep = "-", 
+                    fill = "right", 
+                    remove = FALSE) %>%
+    mutate(
+      home_score = suppressWarnings(as.integer(home_score_chr)),
+      away_score = suppressWarnings(as.integer(away_score_chr)),
+      date_key = if (inherits(date, "Date")) date else suppressWarnings(mdy(as.character(date))),
+      date_clean = if_else(is.na(date_key), str_remove_all(as.character(date), "\\s*\\(\\d+\\)"), as.character(date)),
+      date_key = coalesce(date_key, mdy(date_clean)),
+      match_key = paste(format(date_key, "%Y-%m-%d"), home_team, "vs", away_team, sep = "_"),
+      invalid_score = if_else(!str_detect(score, "^\\d+-\\d+$"), TRUE, FALSE)) %>%
+    select(-home_score_chr, -away_score_chr, -date_clean)
+  
+  pbp_c_score <- pbp_c %>% 
+    dplyr::filter(!invalid_score) %>%
+    mutate(home_score = as.integer(str_extract(score, "^\\d+")), 
+           away_score = as.integer(str_extract(score, "(?<=-)\\d+")))
+  
+  # sequence point indices
+  pbp_c_score <- pbp_c_score %>%
+    group_by(match_key, set) %>%
+    mutate(score_pair = paste0(home_score, "-", away_score),
+           score_pair_prev = lag(score_pair),
+           point_change = score_pair != score_pair_prev,
+           point_id = cumsum(replace_na(point_change, TRUE))) %>%
+    ungroup()
+  
+  # isolate actual scoring boundary shifts
+  pbp_points <- pbp_c_score %>%
+    filter(!is.na(match_key)) %>%
+    arrange(match_key, set, date_key) %>% 
+    group_by(match_key, set) %>%
+    mutate(home_delta = home_score - lag(home_score),
+           away_delta = away_score - lag(away_score),
+           point_scored_row = (home_delta == 1 & (away_delta %in% c(0, NA))) | 
+             (away_delta == 1 & (home_delta %in% c(0, NA)))) %>%
+    ungroup()
+  
+  pbp_points_scored <- pbp_points %>% filter(point_scored_row, 
+                                             !is.na(match_key))
+  return(pbp_points_scored)}
+
+# run the ingestion pipeline
+pbp_points_scored <- process_volleyball_data(pbp, teammatch, playermatch)
+```
+
+Each row in the prepared dataset corresponds with the end of a rally, where one team won the rally and their score increased by exactly 1. Below is a snapshot of the structured sequence data:
+
+```{r}
+#| echo: false
+pbp_points_scored %>%
+  select(match_key, set, team, event, home_score, away_score, player, description) %>%
+  head(5) %>%
+  knitr::kable()
+```
+
+## Expected Points (EP) Model
+
+To further transform the point-level data to prepare for the Expected Points model, we added variables relevant for modeling. We formulated a binary indicator, `scoring_team_is_home`, to denote whether the home team scored the point. The context immediately prior to the play is captured via `score_diff_before`.
+
+To regularize raw structural variation, we collapsed text variations in the `event` variable into consolidated strategic categories: **Kill, Error, Block, Ace, Serve, and Other**.
+
+```{r}
+#| code-summary: "Expand to view variable transformations"
+pbp_model <- pbp_points_scored %>%
+  mutate(
+    #binary variable for if home or away team won rally
+    scoring_team_is_home = if_else(team == home_team, 1, 0),
+    #calculate score margin prior to current play
+    score_diff_before = home_score - away_score - scoring_team_is_home,
+    #convert set number into categorical factor
+    set_factor = factor(set),
+    #consolidate event strings into standardized categories
+    event_simplified = case_when(
+      str_detect(tolower(event), "kill") ~ "Kill",
+      str_detect(tolower(event), "block") ~ "Block",
+      str_detect(tolower(event), "error") ~ "Error",
+      str_detect(tolower(event), "ace") ~ "Ace",
+      str_detect(tolower(event), "serve") ~ "Serve",
+      TRUE ~ "Other"),
+    event_simplified = factor(event_simplified)) %>%
+  #keep only necessary modeling features
+  select(match_key, set_factor, event, event_simplified, home_score, 
+         away_score, score_diff_before, scoring_team_is_home)
+```
+
+`pbp_model` is a simplified and cleaned version of the play-by-play data that includes only the variables needed to fit our Expected Points (EP) model, with one row per rally and all information required to predict whether the home team will score the next point.
+
+To build our baseline EP model, we fit a generalized linear model (GLM) using the `speedglm` package on a representative sample of matches to forecast the likelihood that the home team scores the next rally given the active context.
+
+The GLM predicted `scoring_team_is_home` modeled on three key predictors:
+
+- `score_diff_before`: home score - away score before the rally
+
+- `set_factor`: categorical indicator for set number (1-5)
+
+- `event_simplified`: simplified rally ending events (kill, block, error, serve, ace, or other
+
+```{r}
+#| code-summary: "Expand to view GLM fitting"
+#set seed for reproducible results
+set.seed(123) 
+
+#randomly sample 100,000 for memory/performance efficiency
+idx <- sample.int(nrow(pbp_model), size = min(100000, nrow(pbp_model)))
+pbp_small <- pbp_model[idx, , drop = FALSE]
+
+#fit binomial logistic regression expected points model
+ep_model_clean <- speedglm::speedglm(
+  scoring_team_is_home ~ score_diff_before + set_factor + event_simplified,
+  data = pbp_small,
+  family = binomial())
+
+#output regression coefficients and p-values
+summary(ep_model_clean)
+```
+
+This model predicts the probability that the home team scores in the next rally, which we then used to produce Expected Points (EP) values and assign each rally an EP value between 0 and 1, predicting whether or not the home team will score the next point.
+
+```{r}
+#| code-summary: "Expand to view prediction generation"
+#generate out of sample expected point probabilities for all rallies
+pbp_ep <- pbp_model %>%
+  mutate(ep_home = predict(ep_model_clean, 
+                           newdata = pbp_model, 
+                           type = "response"))
+```
+
+EP values close to 1 indicate the home team is expected to score the next point, whereas EP values close to 0 signify the away team has a high likelihood to score, and EP values around 0.5 reflect both teams having a roughly even chance of scoring.
+
+```{r}
+#| echo: false
+pbp_ep %>%
+  summarise(mean_ep = mean(ep_home, na.rm = TRUE),
+            min_ep  = min(ep_home, na.rm = TRUE),
+            max_ep  = max(ep_home, na.rm = TRUE)) %>%
+  knitr::kable()
+```
+
+The average predicted EP is 0.512, showing rallies are very balanced, and the range of EP values between 0.016 and 0.986 shows the model's ability to detect rallies where one side is almost certain to score.
+
+## Expected Points Added (EPA) per rally
+
+By linking the Expected Points values to individual players, we derive **Expected Points Added (EPA)** for every rally:
+
+\$\$\\text{EPA} = \\text{EP}\_{\\text{after\\\_rally}} - \\text{EP}\_{\\text{before\\\_rally}}\$\$
+
+This measures how much a player’s action (like a kill, ace, or error) changes the team’s probability of scoring.
+
+```{r}
+#| code-summary: "Expand to view EPA formulation"
+#derive point by point EPA (delta in expected points before and after play)
+pbp_ep <- pbp_ep %>%
+  group_by(match_key, set_factor) %>%
+  arrange(home_score + away_score, .by_group = TRUE) %>%
+  mutate(point_index = home_score + away_score, 
+         ep_before = lag(ep_home),
+         epa = ep_home - ep_before) %>%
+  ungroup()
+
+#clean player season dataset
+playerseason_c <- clean_names_safe(playerseason)
+
+#map plays to players with event records
+rallies_with_keys <- pbp_points_scored %>%
+  dplyr::filter(point_scored_row, !is.na(match_key)) %>%
+  dplyr::mutate(set_factor = factor(set)) %>%
+  dplyr::group_by(match_key, set_factor) %>%
+  dplyr::arrange(home_score + away_score, .by_group = TRUE) %>%
+  dplyr::mutate(point_index = home_score + away_score) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(match_key, set_factor, point_index, team, player, event)
+
+#join rally EPA metrics with specific player events
+epa_with_players <- pbp_ep %>%
+  dplyr::filter(!is.na(epa)) %>%
+  dplyr::select(match_key, set_factor, point_index, epa) %>%
+  dplyr::inner_join(rallies_with_keys, by = c("match_key", "set_factor", "point_index"))
+
+#aggregate play by play EPA at the player-team level
+player_epa <- epa_with_players %>%
+  dplyr::filter(!is.na(player), player != "") %>%
+  dplyr::group_by(player, team) %>%
+  dplyr::summarise(
+    points_tagged = dplyr::n(),
+    total_epa = sum(epa, na.rm = TRUE),
+    mean_epa  = mean(epa, na.rm = TRUE),
+    .groups = "drop")
+
+#strip player strings
+player_epa_clean <- player_epa %>%
+  mutate(player_clean = str_squish(str_remove(player, "\\s*\\(.*\\)$")))
+
+#map primary player positions
+pos_map <- playerseason %>%
+  rename(pos = Pos, player_raw = Player, team_raw = Team) %>%
+  mutate(player_clean = str_squish(str_remove(player_raw, "\\s*\\(.*\\)$"))) %>%
+  filter(!is.na(pos), pos != "") %>%                
+  count(player_clean, team_raw, pos, name = "n") %>% 
+  group_by(player_clean, team_raw) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%         
+  ungroup() %>%
+  transmute(player_clean, team_raw, pos)
+
+#combine player EPA data with primary season position mapping
+player_epa_pos <- player_epa_clean %>%
+  left_join(pos_map, by = c("player_clean" = "player_clean", "team" = "team_raw"))
+
+#create secondary fallback position map from player match records
+pos_map_pm <- playermatch %>%
+  dplyr::rename(pos_raw = P, player_raw = Player, team_raw = Team) %>%
+  dplyr::filter(!is.na(pos_raw), pos_raw != "") %>%
+  dplyr::mutate(player_clean = stringr::str_squish(stringr::str_remove(player_raw, "\\s*\\(.*\\)$"))) %>%
+  dplyr::count(player_clean, pos_raw, name = "n") %>%
+  dplyr::group_by(player_clean) %>%
+  dplyr::slice_max(n, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+#function to harmonize raw position strings into standard positional groups
+standardize_pos <- function(x) {
+  x <- toupper(trimws(x))
+  dplyr::case_when(
+    x %in% c("OH") ~ "OH",
+    x %in% c("RS","OPP","RIGHT","RSH") ~ "OPP",
+    x %in% c("MB","MH","MIDDLE") ~ "MB",
+    x %in% c("S","SETTER") ~ "S",
+    x %in% c("L","L/DS","DS","LIBERO") ~ "L/DS",
+    TRUE ~ NA_character_)}
+
+#standardize match level fallback positions
+pos_map_pm <- pos_map_pm %>%
+  dplyr::mutate(pos_pm = standardize_pos(pos_raw)) %>%
+  dplyr::select(player_clean, pos_pm)
+
+#input missing primary positions using match level secondary map
+player_epa_pos2 <- player_epa_pos %>%
+  dplyr::left_join(pos_map_pm, by = "player_clean") %>%
+  dplyr::mutate(pos_final = dplyr::coalesce(pos, pos_pm)) %>%
+  dplyr::select(player, team, points_tagged, total_epa, mean_epa, pos_final)
+
+#final clean consolidation of position labels
+player_epa_pos3 <- player_epa_pos2 %>%
+  mutate(pos_final = toupper(trimws(pos_final))) %>%
+  mutate(pos_final = case_when(
+    pos_final %in% c("DS", "L", "MH") ~ "L/DS",  
+    pos_final %in% c("RS") ~ "OPP",
+    pos_final %in% c("MH") ~ "MB",
+    TRUE ~ pos_final))
+```
+
+Sorting by `total_epa` allows ranking the most influential players based on their contribution to expected scoring changes.
+
+```{r}
+#| echo: false
+player_epa %>%
+  filter(!is.na(player), player != "") %>%
+  arrange(desc(total_epa)) %>%
+  head(15) %>%
+  knitr::kable(
+    col.names = c("Player", "Team", "Touches Tagged", "Total EPA", "Mean EPA"),
+    digits = 3)
+```
+
+We now have per-player workload (`points_tagged`) and impact (`total_epa`, `mean_epa`) with corresponding positional categories. From this we will define replacement level players in order to compute position adjusted WAR.
+
+## Wins Above Replacement (WAR)
+
+To build a reliable baseline framework, we filtered out low-sample observations to retain players with a sufficient sample size of game data ($\ge 150$ tagged points).
+
+A position-specific replacement baseline ($20^{\text{th}}$ percentile of execution) was computed to act as our structural evaluation threshold. Defining the replacement level provides a reference framework for evaluating individual player impact, quantifying their performance relative to the typical benchmark level at their position.
+
+```{r}
+#| code-summary: "Expand to view WAR framework"
+#filter dataset for high volume players
+player_core <- player_epa_pos3 %>%
+  dplyr::filter(!is.na(pos_final), points_tagged >= 150)
+
+#calculate bottom 20th percentile replacement benchmark by position group
+repl_by_pos <- player_core %>%
+  dplyr::group_by(pos_final) %>%
+  dplyr::summarise(
+    #20th percentile threshold cutoff
+    threshold = quantile(mean_epa, probs = 0.20, na.rm = TRUE),
+    #average performance of players at or below replacement threshold
+    repl_mean_epa = mean(mean_epa[mean_epa <= threshold], na.rm = TRUE),
+    n_players = dplyr::n(),
+    .groups = "drop")
+
+#display calculated replacement values per position
+repl_by_pos %>% knitr::kable(digits = 4)
+```
+
+We then computed a Value Above Replacement (VAR), quantifying how much a player exceeds typical performance at their position. To scale this individual efficiency over the replacement baseline to calculate a seasonal volume adjusted metric for each player:
+
+\$\$\\text{WAR} = (\\text{Mean EPA} - \\text{Replacement Mean EPA}) \\times \\text{Points Tagged}\$\$
+
+```{r}
+#| code-summary: "Expand to view scaled WAR calculation"
+player_war <- player_core %>%
+  #join position specific replacement threshold
+  dplyr::left_join(repl_by_pos, by = "pos_final") %>%
+  dplyr::mutate(
+    #efficiency differential relative to position replacement baseline
+    var_epa = mean_epa - repl_mean_epa,
+    #volume adjusted WAR metric (value above replacement * total touches)
+    war_like = var_epa * points_tagged   
+  ) %>%
+  dplyr::arrange(dplyr::desc(war_like))
+```
+
+## Diagnostic Insights & Positional Analysis
+
+### Overall Leaderboard
+
+Explore the interactive table below to see the season's top-performing players by individual WAR values.
+
+```{r}
+#| echo: false
+#format and render the final WAR metrics inside an interactive searchable table
+player_war %>%
+  select(player, team, pos_final, points_tagged, mean_epa, war_like) %>%
+  rename(
+    Player = player, 
+    Team = team, 
+    Position = pos_final, 
+    Touches = points_tagged, 
+    `Mean EPA` = mean_epa, 
+    WAR = war_like) %>%
+  datatable(
+    filter = 'top', 
+    options = list(pageLength = 10, autoWidth = TRUE)) %>%
+  formatRound(columns=c('Mean EPA', 'WAR'), digits=3)
+```
+
+### Top 10 Standouts by Position Group
+
+The plot below breaks down efficiency gains across individual tactical domains, illustrating which players create the largest output variations.
+
+```{r}
+#| echo: false
+top10_bypos <- player_war %>%
+  group_by(pos_final) %>%
+  slice_max(war_like, n = 10, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(player_label = paste0(player, " (", team, ")"))
+
+ggplot(top10_bypos, aes(x = fct_reorder(player_label, war_like), y = war_like, fill = pos_final)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ pos_final, scales = "free_y", ncol = 2) +  
+  scale_fill_viridis_d(option = "plasma") +
+  labs(
+    title = "Top 10 WAR Leaders by Position Group",
+    subtitle = "Cumulative expected points added relative to the position baseline",
+    x = NULL, y = "WAR (Points Above Replacement)"
+  ) +
+  theme_minimal(base_size = 11) +  
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold"),
+    panel.spacing = unit(1.5, "lines")
+  )
+```
+
+Positional insights:
+
+- Opposite (OPP) and outside (OH) hitters: largest WAR increases per EPA gain
+
+- Setters (S): steady WAR despite smaller EPA range
+
+- Liberos and Defense Specialists (L/DS): low variance, defensive stability
+
+### Volumetric Scaling: Efficiency vs. WAR Value
+
+Analyzing the interaction between efficiency and volume reveals how roles scale across different positions on the court.
+
+```{r}
+#| echo: false
+ggplot(player_war, aes(x = mean_epa, y = war_like, color = pos_final)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.75, linewidth = 1.2) +
+  scale_color_viridis_d() +
+  labs(
+    title = "WAR Scaling Dynamics vs. Average Efficiency",
+    subtitle = "LOESS trends demonstrating positional efficiency vs seasonal contribution",
+    x = "Mean EPA per Rally", y = "Seasonal WAR Metric", color = "Position"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+The scatter plot highlights the interplay between workload and efficiency: players with higher average EPA but fewer plays may have lower WAR-like values, while those with consistent EPA and heavier workloads accumulate greater WAR-like contributions. The LOESS trendlines for each position reveal typical contribution patterns across roles, helping identify which positions yield higher WAR-like values for a given average EPA and we can see clear differences between position groups.
+
+- **Outside Hitters (OH):** Covers the broadest spectrum of efficiency, illustrating high volatility and variance in seasonal impact.
+
+- **Opposites (OPP):** Displays the steepest curve slope, showing that marginal gains in offensive efficiency yield major returns in cumulative team wins.
+
+- **Setters & Defensive Specialists (L/DS):** Exhibit compressed horizontal efficiency clusters, highlighting highly consistent and dependable support play.
+
+## Limitations and Future Work
+
+Several practical and methodological limitations of our analysis should be noted.
+
+First, the play-by-play dataset was extremely large (over 5.6 million rows), which exceeded the feasible memory and runtime for a full logistic regression in R. To address this, we estimated the expected points model using the speedglm package on a random sample of 100,000 rallies, which provides computational efficiency but may slightly increase variance in coefficient estimates compared to fitting on the full dataset.
+
+Second, data cleaning required excluding a small portion of problematic records. Approximately 6,500 rallies had invalid or unparseable score strings (e.g., duplicated entries or malformed text such as “Air Force subs…”). These were filtered out because they could not reliably indicate a scoring outcome.
+
+Third, player position data were incomplete. The position field (pos_final) contained a significant number of missing values, especially for less frequently recorded players or schools with inconsistent reporting. To ensure consistency in position based WAR comparisons, we restricted the replacement-level calculations and position visualizations to players with a known position, effectively excluding those with NA positions. This exclusion slightly reduced the total sample size but avoided biased or misclassified positional averages.
+
+Finally, this analysis did not model contextual or temporal dependencies such as rotation order, serve-receive quality, or opponent strength. The current model assumes rally independence and equal competitive balance across teams, which is an approximation. Additionally, replacement level thresholds and WAR-like scaling were arbitrarily determined, meaning the exact magnitudes of value are approximate even if the relative rankings are informative.
+
+Despite these limitations, the we established a foundation for rally level value modeling in volleyball. In the future, additional computing resources and incorporating other models to account for non linear patterns would allow for more precise analysis. Additional analysis that adjusts for opponent quality and rotational tracking and context would also improve precision and realism. This framework can also be extended to team-level win probability and cross-season validation to produce additional insights.
+
+## References
+
+Stevens, Jeffrey R. 2023. “ncaavolleyballr: NCAA Women’s Volleyball Play-by-Play Data.” <https://jeffreyrstevens.github.io/ncaavolleyballr/articles/data.html>
